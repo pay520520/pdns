@@ -245,6 +245,9 @@ class PowerDNSAPI
             $priority = isset($data['priority']) ? (int) $data['priority'] : 10;
             return $priority . ' ' . $this->ensureTrailingDot($content);
         }
+        if ($type === 'TXT') {
+            return $this->normalizeTxtInput($content, true);
+        }
         if (in_array($type, ['CNAME', 'NS', 'PTR'], true)) {
             return $this->ensureTrailingDot($content);
         }
@@ -262,6 +265,24 @@ class PowerDNSAPI
             $this->normalizeContentForId($type, $content)
         );
     }
+
+    private function normalizeTxtInput(string $content, bool $wrapQuotes = true): string
+    {
+        $decoded = html_entity_decode($content, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $trimmed = trim($decoded);
+        if ($trimmed === '') {
+            return $wrapQuotes ? '""' : '';
+        }
+        if ($trimmed[0] === '"' && substr($trimmed, -1) === '"' && strlen($trimmed) >= 2) {
+            $trimmed = substr($trimmed, 1, -1);
+        }
+        if (!$wrapQuotes) {
+            return $trimmed;
+        }
+        $escaped = str_replace('"', '\"', $trimmed);
+        return '"' . $escaped . '"';
+    }
+
 
     private function normalizeTtl($ttl): int
     {
@@ -416,6 +437,9 @@ class PowerDNSAPI
         // Normalize content for certain record types
         if (in_array($type, ['CNAME', 'MX', 'NS', 'PTR'])) {
             $content = $this->ensureTrailingDot($content);
+        }
+        if ($type === 'TXT') {
+            $content = $this->normalizeTxtInput($content, true);
         }
 
         // First, get existing records for this name+type
