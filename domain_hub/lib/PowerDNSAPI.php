@@ -286,6 +286,26 @@ class PowerDNSAPI
         return '"' . $escaped . '"';
     }
 
+    private function recordIdMatches(string $recordId, string $name, string $type, string $content): bool
+    {
+        $computed = $this->buildRecordIdFromRaw($name, $type, $content);
+        if ($computed === $recordId) {
+            return true;
+        }
+        if (strtoupper($type) === 'TXT') {
+            $legacy = $this->generateRecordId(
+                $this->stripTrailingDot($name),
+                strtoupper($type),
+                $content
+            );
+            if ($legacy === $recordId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
     private function findRecordContextById(array $rrsets, string $recordId): ?array
     {
         foreach ($rrsets as $rrset) {
@@ -293,8 +313,7 @@ class PowerDNSAPI
             $type = strtoupper($rrset['type'] ?? '');
             $records = $rrset['records'] ?? [];
             foreach ($records as $record) {
-                $existingId = $this->buildRecordIdFromRaw($name, $type, $record['content'] ?? '');
-                if ($existingId === $recordId) {
+                if ($this->recordIdMatches($recordId, $name, $type, $record['content'] ?? '')) {
                     return [
                         'name' => $name,
                         'type' => $type,
@@ -692,8 +711,7 @@ class PowerDNSAPI
             $name = $rrset['name'] ?? '';
             $type = strtoupper($rrset['type'] ?? '');
             foreach (($rrset['records'] ?? []) as $record) {
-                $existingId = $this->buildRecordIdFromRaw($name, $type, $record['content'] ?? '');
-                if ($existingId === $recordId) {
+                if ($this->recordIdMatches($recordId, $name, $type, $record['content'] ?? '')) {
                     $targetName = $name;
                     $targetType = $type;
                     $targetRecords = $rrset['records'] ?? [];
