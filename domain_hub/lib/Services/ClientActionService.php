@@ -1519,18 +1519,26 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
                                         $final_content = $caa_content;
                                     }
 
+                                    $updatedRecordId = isset($res['result']['id']) ? (string) $res['result']['id'] : null;
+
+                                    $updatePayload = [
+                                        'type' => $record_type_upper,
+                                        'name' => $newFullName,
+                                        'content' => $final_content,
+                                        'ttl' => $record_ttl,
+                                        'proxied' => 0,
+                                        'line' => $line,
+                                        'priority' => in_array($record_type_upper, ['MX','SRV']) ? $record_priority : null,
+                                        'updated_at' => date('Y-m-d H:i:s')
+                                    ];
+                                    if ($updatedRecordId !== null && $updatedRecordId !== '') {
+                                        $updatePayload['record_id'] = $updatedRecordId;
+                                        $targetRecord->record_id = $updatedRecordId;
+                                    }
+
                                     Capsule::table('mod_cloudflare_dns_records')
                                         ->where('id', $targetRecord->id)
-                                        ->update([
-                                            'type' => $record_type_upper,
-                                            'name' => $newFullName,
-                                            'content' => $final_content,
-                                            'ttl' => $record_ttl,
-                                            'proxied' => 0,
-                                            'line' => $line,
-                                            'priority' => in_array($record_type_upper, ['MX','SRV']) ? $record_priority : null,
-                                            'updated_at' => date('Y-m-d H:i:s')
-                                        ]);
+                                        ->update($updatePayload);
 
                                     if ($newFullName === $record->subdomain) {
                                         Capsule::table('mod_cloudflare_subdomain')
