@@ -235,6 +235,9 @@ class PowerDNSAPI
         if (in_array($type, ['CNAME', 'MX', 'NS', 'SRV', 'PTR'], true)) {
             return $this->stripTrailingDot($content);
         }
+        if ($type === 'TXT') {
+            return $this->normalizeTxtInput($content, false);
+        }
         return $content;
     }
 
@@ -281,6 +284,43 @@ class PowerDNSAPI
         }
         $escaped = str_replace('"', '\"', $trimmed);
         return '"' . $escaped . '"';
+    }
+
+    private function findRecordContextById(array $rrsets, string $recordId): ?array
+    {
+        foreach ($rrsets as $rrset) {
+            $name = $rrset['name'] ?? '';
+            $type = strtoupper($rrset['type'] ?? '');
+            $records = $rrset['records'] ?? [];
+            foreach ($records as $record) {
+                $existingId = $this->buildRecordIdFromRaw($name, $type, $record['content'] ?? '');
+                if ($existingId === $recordId) {
+                    return [
+                        'name' => $name,
+                        'type' => $type,
+                        'ttl' => $rrset['ttl'] ?? self::DEFAULT_TTL,
+                        'records' => $records,
+                    ];
+                }
+            }
+        }
+        return null;
+    }
+
+    private function getRrsetContext(array $rrsets, string $name, string $type): array
+    {
+        foreach ($rrsets as $rrset) {
+            if (($rrset['name'] ?? '') === $name && strtoupper($rrset['type'] ?? '') === $type) {
+                return [
+                    'records' => $rrset['records'] ?? [],
+                    'ttl' => $rrset['ttl'] ?? self::DEFAULT_TTL,
+                ];
+            }
+        }
+        return [
+            'records' => [],
+            'ttl' => self::DEFAULT_TTL,
+        ];
     }
 
 
@@ -519,49 +559,100 @@ class PowerDNSAPI
         }
 
         $rrsets = $zoneDetail['result']['rrsets'] ?? [];
-        $recordsPayload = [];
-        $recordMatched = false;
-        $ttlForPatch = $ttl;
-
-        foreach ($rrsets as $rrset) {
-            if (($rrset['name'] ?? '') === $recordName && strtoupper($rrset['type'] ?? '') === $type) {
-                $ttlForPatch = $this->normalizeTtl($rrset['ttl'] ?? $ttl);
-                foreach (($rrset['records'] ?? []) as $record) {
-                    $existingId = $this->buildRecordIdFromRaw($recordName, $type, $record['content'] ?? '');
-                    if ($existingId === $recordId) {
-                        $recordsPayload[] = [
-                            'content' => $formattedContent,
-                            'disabled' => !empty($record['disabled']),
-                        ];
-                        $recordMatched = true;
-                    } else {
-                        $recordsPayload[] = [
-                            'content' => $record['content'],
-                            'disabled' => !empty($record['disabled']),
-                        ];
-                    }
-                }
-                break;
-            }
+        $existingContext = $this->findRecordContextById($rrsets, $recordId);
+        if (!$existingContext) {
+            return ['success' => false, 'errors' => ['record not found']];
         }
 
-        if (empty($recordsPayload)) {
-            $recordsPayload[] = ['content' => $formattedContent, 'disabled' => false];
-        } elseif (!$recordMatched) {
-            $recordsPayload[] = ['content' => $formattedContent, 'disabled' => false];
+        $sourceName = $existingContext['name'];
+        $sourceType = $existingContext['type'];
+        $sourceRecords = $existingContext['records'] ?? [];
+        $sourceTtl = $this->normalizeTtl($existingContext['ttl'] ?? $ttl);
+
+        $payloadRrsets = [];
+        $targetRecordName = $recordName;
+        $sameName = $this->normalizeRecordName($sourceName) === $targetRecordName;
+        $sameType = $sourceType === $type;
+
+        if ($sameName && $sameType) {
+            $recordsPayload = [];
+            foreach ($sourceRecords as $record) {
+                $existingId = $this->buildRecordIdFromRaw($sourceName, $sourceType, $record['content'] ?? '');
+                if ($existingId === $recordId) {
+                    $recordsPayload[] = [
+                        'content' => $formattedContent,
+                        'disabled' => !empty($record['disabled']),
+                    ];
+                } else {
+                    $recordsPayload[] = [
+                        'content' => $record['content'],
+                        'disabled' => !empty($record['disabled']),
+                    ];
+                }
+            }
+
+            $payloadRrsets[] = [
+                'name' => $sourceName,
+                'type' => $type,
+                'ttl' => $this->normalizeTtl($data['ttl'] ?? $sourceTtl),
+                'changetype' => 'REPLACE',
+                'records' => $recordsPayload,
+            ];
+        } else {
+            $remainingRecords = [];
+            foreach ($sourceRecords as $record) {
+                $existingId = $this->buildRecordIdFromRaw($sourceName, $sourceType, $record['content'] ?? '');
+                if ($existingId === $recordId) {
+                    continue;
+                }
+                $remainingRecords[] = [
+                    'content' => $record['content'],
+                    'disabled' => !empty($record['disabled']),
+                ];
+            }
+
+            if (empty($remainingRecords)) {
+                $payloadRrsets[] = [
+                    'name' => $sourceName,
+                    'type' => $sourceType,
+                    'changetype' => 'DELETE',
+                ];
+            } else {
+                $payloadRrsets[] = [
+                    'name' => $sourceName,
+                    'type' => $sourceType,
+                    'ttl' => $sourceTtl,
+                    'changetype' => 'REPLACE',
+                    'records' => $remainingRecords,
+                ];
+            }
+
+            $targetContext = $this->getRrsetContext($rrsets, $targetRecordName, $type);
+            $targetRecords = [];
+            foreach ($targetContext['records'] as $record) {
+                $targetRecords[] = [
+                    'content' => $record['content'],
+                    'disabled' => !empty($record['disabled']),
+                ];
+            }
+            $targetRecords[] = [
+                'content' => $formattedContent,
+                'disabled' => false,
+            ];
+
+            $targetTtl = $this->normalizeTtl($data['ttl'] ?? ($targetContext['ttl'] ?? $ttl));
+            $payloadRrsets[] = [
+                'name' => $recordName,
+                'type' => $type,
+                'ttl' => $targetTtl,
+                'changetype' => 'REPLACE',
+                'records' => $targetRecords,
+            ];
         }
 
         $endpoint = '/servers/' . urlencode($this->server_id) . '/zones/' . urlencode($zoneName);
         $payload = [
-            'rrsets' => [
-                [
-                    'name' => $recordName,
-                    'type' => $type,
-                    'ttl' => $ttlForPatch,
-                    'changetype' => 'REPLACE',
-                    'records' => $recordsPayload,
-                ]
-            ]
+            'rrsets' => $payloadRrsets,
         ];
 
         $res = $this->request('PATCH', $endpoint, $payload);
