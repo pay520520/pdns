@@ -229,6 +229,40 @@ class PowerDNSAPI
         return null;
     }
 
+    private function normalizeContentForId(string $type, string $content): string
+    {
+        $type = strtoupper($type);
+        if (in_array($type, ['CNAME', 'MX', 'NS', 'SRV', 'PTR'], true)) {
+            return $this->stripTrailingDot($content);
+        }
+        return $content;
+    }
+
+    private function formatRecordContentForPatch(string $type, string $content, array $data = []): string
+    {
+        $type = strtoupper($type);
+        if ($type === 'MX') {
+            $priority = isset($data['priority']) ? (int) $data['priority'] : 10;
+            return $priority . ' ' . $this->ensureTrailingDot($content);
+        }
+        if (in_array($type, ['CNAME', 'NS', 'PTR'], true)) {
+            return $this->ensureTrailingDot($content);
+        }
+        if ($type === 'CAA' || $type === 'SRV') {
+            return $content;
+        }
+        return $content;
+    }
+
+    private function buildRecordIdFromRaw(string $name, string $type, string $content): string
+    {
+        return $this->generateRecordId(
+            $this->stripTrailingDot($name),
+            strtoupper($type),
+            $this->normalizeContentForId($type, $content)
+        );
+    }
+
     private function normalizeTtl($ttl): int
     {
         $t = intval($ttl);
@@ -245,6 +279,12 @@ class PowerDNSAPI
             return $value . '.';
         }
         return $value;
+    }
+
+    private function loadZoneDetail(string $zoneName): array
+    {
+        $endpoint = '/servers/' . urlencode($this->server_id) . '/zones/' . urlencode($zoneName);
+        return $this->request('GET', $endpoint);
     }
 
     // ==================== Public API Methods ====================
@@ -447,25 +487,55 @@ class PowerDNSAPI
         }
 
         $recordName = $this->normalizeRecordName($name);
+        $formattedContent = $this->formatRecordContentForPatch($type, $content, $data);
 
-        // Normalize content for certain record types
-        if (in_array($type, ['CNAME', 'MX', 'NS', 'PTR'])) {
-            $content = $this->ensureTrailingDot($content);
+        $zoneDetail = $this->loadZoneDetail($zoneName);
+        if (!($zoneDetail['success'] ?? false)) {
+            return ['success' => false, 'errors' => $zoneDetail['errors'] ?? ['query failed']];
         }
 
-        // For update, we replace the entire RRset with the single new value
-        $endpoint = '/servers/' . urlencode($this->server_id) . '/zones/' . urlencode($zoneName);
+        $rrsets = $zoneDetail['result']['rrsets'] ?? [];
+        $recordsPayload = [];
+        $recordMatched = false;
+        $ttlForPatch = $ttl;
 
+        foreach ($rrsets as $rrset) {
+            if (($rrset['name'] ?? '') === $recordName && strtoupper($rrset['type'] ?? '') === $type) {
+                $ttlForPatch = $this->normalizeTtl($rrset['ttl'] ?? $ttl);
+                foreach (($rrset['records'] ?? []) as $record) {
+                    $existingId = $this->buildRecordIdFromRaw($recordName, $type, $record['content'] ?? '');
+                    if ($existingId === $recordId) {
+                        $recordsPayload[] = [
+                            'content' => $formattedContent,
+                            'disabled' => !empty($record['disabled']),
+                        ];
+                        $recordMatched = true;
+                    } else {
+                        $recordsPayload[] = [
+                            'content' => $record['content'],
+                            'disabled' => !empty($record['disabled']),
+                        ];
+                    }
+                }
+                break;
+            }
+        }
+
+        if (empty($recordsPayload)) {
+            $recordsPayload[] = ['content' => $formattedContent, 'disabled' => false];
+        } elseif (!$recordMatched) {
+            $recordsPayload[] = ['content' => $formattedContent, 'disabled' => false];
+        }
+
+        $endpoint = '/servers/' . urlencode($this->server_id) . '/zones/' . urlencode($zoneName);
         $payload = [
             'rrsets' => [
                 [
                     'name' => $recordName,
                     'type' => $type,
-                    'ttl' => $ttl,
+                    'ttl' => $ttlForPatch,
                     'changetype' => 'REPLACE',
-                    'records' => [
-                        ['content' => $content, 'disabled' => false]
-                    ],
+                    'records' => $recordsPayload,
                 ]
             ]
         ];
@@ -476,20 +546,97 @@ class PowerDNSAPI
             return ['success' => false, 'errors' => $res['errors'] ?? ['update failed']];
         }
 
-        return ['success' => true, 'result' => ['id' => $recordId]];
+        $newRecordId = $this->buildRecordIdFromRaw($recordName, $type, $formattedContent);
+
+        return ['success' => true, 'result' => ['id' => $newRecordId]];
     }
 
     /**
      * Delete a subdomain/record
      */
-    public function deleteSubdomain(string $zoneId, string $recordId): array
+        public function deleteSubdomain(string $zoneId, string $recordId): array
     {
-        // For PowerDNS, we need the name and type to delete
-        // The recordId format is: pdns_<hash> or we need context from caller
+        $zoneName = $this->normalizeZoneName($zoneId);
+        $recordId = (string) $recordId;
 
-        // If caller provides structured data, use it
-        // Otherwise, we cannot delete without name/type info
-        return ['success' => false, 'errors' => ['PowerDNS requires name and type for deletion. Use deleteDomainRecords instead.']];
+        if ($recordId === '') {
+            return ['success' => false, 'errors' => ['record id required']];
+        }
+
+        $zoneDetail = $this->loadZoneDetail($zoneName);
+        if (!($zoneDetail['success'] ?? false)) {
+            return ['success' => false, 'errors' => $zoneDetail['errors'] ?? ['query failed']];
+        }
+
+        $targetName = '';
+        $targetType = '';
+        $targetRecords = [];
+        $ttl = self::DEFAULT_TTL;
+
+        foreach (($zoneDetail['result']['rrsets'] ?? []) as $rrset) {
+            $name = $rrset['name'] ?? '';
+            $type = strtoupper($rrset['type'] ?? '');
+            foreach (($rrset['records'] ?? []) as $record) {
+                $existingId = $this->buildRecordIdFromRaw($name, $type, $record['content'] ?? '');
+                if ($existingId === $recordId) {
+                    $targetName = $name;
+                    $targetType = $type;
+                    $targetRecords = $rrset['records'] ?? [];
+                    $ttl = $this->normalizeTtl($rrset['ttl'] ?? $ttl);
+                    break 2;
+                }
+            }
+        }
+
+        if ($targetName === '') {
+            return ['success' => false, 'errors' => ['record not found']];
+        }
+
+        $remainingRecords = [];
+        foreach ($targetRecords as $record) {
+            $existingId = $this->buildRecordIdFromRaw($targetName, $targetType, $record['content'] ?? '');
+            if ($existingId === $recordId) {
+                continue;
+            }
+            $remainingRecords[] = [
+                'content' => $record['content'],
+                'disabled' => !empty($record['disabled']),
+            ];
+        }
+
+        $endpoint = '/servers/' . urlencode($this->server_id) . '/zones/' . urlencode($zoneName);
+
+        if (empty($remainingRecords)) {
+            $payload = [
+                'rrsets' => [
+                    [
+                        'name' => $targetName,
+                        'type' => $targetType,
+                        'changetype' => 'DELETE',
+                    ]
+                ]
+            ];
+        } else {
+            $payload = [
+                'rrsets' => [
+                    [
+                        'name' => $targetName,
+                        'type' => $targetType,
+                        'ttl' => $ttl,
+                        'changetype' => 'REPLACE',
+                        'records' => $remainingRecords,
+                    ]
+                ]
+            ];
+        }
+
+        $res = $this->request('PATCH', $endpoint, $payload);
+
+        if (!($res['success'] ?? false)) {
+            return ['success' => false, 'errors' => $res['errors'] ?? ['delete failed']];
+        }
+
+        return ['success' => true, 'result' => []];
     }
 
     /**
