@@ -1158,16 +1158,43 @@ if($_POST['action'] == "create_dns" && isset($_POST['subdomain_id'])) {
                                 }
 
                                 if ($creation) {
+                                    $recordSyncApplied = false;
                                     try {
                                         $fresh = $cf->getDnsRecords($record->cloudflare_zone_id, $record->subdomain);
                                         if (($fresh['success'] ?? false)) {
                                             foreach (($fresh['result'] ?? []) as $fr) {
+                                                $remoteRecordId = isset($fr['id']) ? (string) $fr['id'] : null;
+                                                if ($updatedRecordId !== null && $remoteRecordId === $updatedRecordId) {
+                                                    $recordSyncApplied = true;
+                                                    $remoteContent = (string)($fr['content'] ?? $final_content);
+                                                    $remoteName = (string)($fr['name'] ?? $newFullName);
+                                                    $remoteType = strtoupper(trim((string)($fr['type'] ?? $record_type_upper)));
+                                                    $remoteTtl = intval($fr['ttl'] ?? $record_ttl);
+                                                    Capsule::table('mod_cloudflare_dns_records')
+                                                        ->where('id', $targetRecord->id)
+                                                        ->update([
+                                                            'type' => $remoteType,
+                                                            'name' => $remoteName,
+                                                            'content' => $remoteContent,
+                                                            'ttl' => $remoteTtl,
+                                                            'proxied' => 0,
+                                                            'line' => $line,
+                                                            'priority' => in_array($record_type_upper, ['MX','SRV']) ? $record_priority : null,
+                                                            'record_id' => $remoteRecordId,
+                                                            'updated_at' => date('Y-m-d H:i:s')
+                                                        ]);
+                                                    $targetRecord->record_id = $remoteRecordId;
+                                                    $final_content = $remoteContent;
+                                                    $record_ttl = $remoteTtl;
+                                                    continue;
+                                                }
+
                                                 $exists = self::findLocalRecordByRemote($subdomain_id, $fr);
                                                 if (!$exists) {
                                                     Capsule::table('mod_cloudflare_dns_records')->insert([
                                                         'subdomain_id' => $subdomain_id,
                                                         'zone_id' => $record->cloudflare_zone_id,
-                                                        'record_id' => isset($fr['id']) ? (string) $fr['id'] : null,
+                                                        'record_id' => $remoteRecordId,
                                                         'name' => ($fr['name'] ?? $record->subdomain),
                                                         'type' => strtoupper(trim((string)($fr['type'] ?? 'A'))),
                                                         'content' => (string)($fr['content'] ?? ''),
@@ -1514,31 +1541,35 @@ if($_POST['action'] == "update_dns" && isset($_POST['subdomain_id'])) {
 
                                     CfSubdomainService::syncDnsHistoryFlag($subdomain_id);
 
-                                    $final_content = $record_content;
-                                    if ($record_type_upper === 'CAA' && $caa_content !== null) {
-                                        $final_content = $caa_content;
+                                    if (!$recordSyncApplied) {
+                                        $final_content = $record_content;
+                                        if ($record_type_upper === 'CAA' && $caa_content !== null) {
+                                            $final_content = $caa_content;
+                                        }
+
+                                        $updatedRecordId = isset($res['result']['id']) ? (string) $res['result']['id'] : null;
+
+                                        $updatePayload = [
+                                            'type' => $record_type_upper,
+                                            'name' => $newFullName,
+                                            'content' => $final_content,
+                                            'ttl' => $record_ttl,
+                                            'proxied' => 0,
+                                            'line' => $line,
+                                            'priority' => in_array($record_type_upper, ['MX','SRV']) ? $record_priority : null,
+                                            'updated_at' => date('Y-m-d H:i:s')
+                                        ];
+                                        if ($updatedRecordId !== null && $updatedRecordId !== '') {
+                                            $updatePayload['record_id'] = $updatedRecordId;
+                                            $targetRecord->record_id = $updatedRecordId;
+                                        }
+
+                                        Capsule::table('mod_cloudflare_dns_records')
+                                            ->where('id', $targetRecord->id)
+                                            ->update($updatePayload);
+                                    } else {
+                                        $updatedRecordId = $targetRecord->record_id;
                                     }
-
-                                    $updatedRecordId = isset($res['result']['id']) ? (string) $res['result']['id'] : null;
-
-                                    $updatePayload = [
-                                        'type' => $record_type_upper,
-                                        'name' => $newFullName,
-                                        'content' => $final_content,
-                                        'ttl' => $record_ttl,
-                                        'proxied' => 0,
-                                        'line' => $line,
-                                        'priority' => in_array($record_type_upper, ['MX','SRV']) ? $record_priority : null,
-                                        'updated_at' => date('Y-m-d H:i:s')
-                                    ];
-                                    if ($updatedRecordId !== null && $updatedRecordId !== '') {
-                                        $updatePayload['record_id'] = $updatedRecordId;
-                                        $targetRecord->record_id = $updatedRecordId;
-                                    }
-
-                                    Capsule::table('mod_cloudflare_dns_records')
-                                        ->where('id', $targetRecord->id)
-                                        ->update($updatePayload);
 
                                     if ($newFullName === $record->subdomain) {
                                         Capsule::table('mod_cloudflare_subdomain')
